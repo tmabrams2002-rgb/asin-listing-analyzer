@@ -354,14 +354,38 @@ def main():
         st.info("Upload a CLR to begin.")
         return
 
-    try:
-        if uploaded.name.lower().endswith(".csv"):
-            df = pd.read_csv(uploaded)
-        else:
-            df = pd.read_excel(uploaded)
-    except Exception as e:
-        st.error(f"Could not read file: {e}")
-        return
+    import openpyxl
+
+try:
+    if uploaded.name.lower().endswith((".xlsx", ".xlsm")):
+        wb = openpyxl.load_workbook(uploaded, read_only=True, keep_vba=True)
+
+        sheet_name = st.selectbox(
+            "Select sheet to analyze",
+            wb.sheetnames,
+            index=wb.sheetnames.index("Template") if "Template" in wb.sheetnames else 0
+        )
+
+        header_row = st.number_input(
+            "Row number where column names start",
+            min_value=1,
+            max_value=50,
+            value=4,
+            step=1
+        )
+
+        df = pd.read_excel(
+            uploaded,
+            sheet_name=sheet_name,
+            header=header_row - 1
+        )
+    else:
+        df = pd.read_csv(uploaded)
+
+except Exception as e:
+    st.error(f"Could not read file: {e}")
+    return
+
 
     st.caption(f"Loaded rows: {len(df):,} | columns: {len(df.columns):,}")
 
