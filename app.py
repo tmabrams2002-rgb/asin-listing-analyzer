@@ -699,7 +699,8 @@ def main():
 
         summary_df = pd.DataFrame(summary_rows).sort_values(by="Overall Score (0-100)")
         content_df = pd.DataFrame(content_rows)
-        image_df = pd.DataFrame(image_
+        image_df = pd.DataFrame(image_rows) if image_rows else pd.DataFrame([{"Notes": "No images evaluated."}])
+
 
 
 if __name__ == "__main__":
