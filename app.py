@@ -368,11 +368,12 @@ def main():
     password_gate()
 
     st.subheader("Input Mode")
-    mode = st.radio(
-        "Choose input mode",
-        ["Upload CLR", "Paste ASINs + Upload CLR (analyze only those ASINs)"],
-        horizontal=False
-    )
+mode = st.radio(
+    "Choose input mode",
+    ["Upload CLR", "Paste ASINs + Upload CLR (analyze only those ASINs)", "Paste Flat File Rows (TSV)"],
+    horizontal=False
+)
+
 flat_text = ""
 if mode == "Paste Flat File Rows (TSV)":
     flat_text = st.text_area(
