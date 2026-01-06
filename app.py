@@ -333,6 +333,37 @@ def build_excel(summary_df, content_df, image_df, action_df) -> bytes:
 # -----------------------------
 # Streamlit App
 # -----------------------------
+def parse_flat_file_rows(tsv_text: str) -> pd.DataFrame:
+    rows = []
+    for line in tsv_text.splitlines():
+        if not line.strip():
+            continue
+
+        parts = line.split("\t")
+        parts = [p.strip() for p in parts]
+
+        # Find ASIN value by locating the literal "ASIN" token
+        asin = ""
+        for i, p in enumerate(parts):
+            if p.upper() == "ASIN" and i + 1 < len(parts):
+                asin = parts[i + 1].strip().upper()
+                break
+
+        # Title is typically the 2nd column in your sample
+        title = parts[1] if len(parts) > 1 else ""
+
+        # Grab image URLs anywhere in the row
+        img_urls = [p for p in parts if p.startswith("http") and ".jpg" in p.lower()]
+
+        if asin:
+            rows.append({
+                "ASIN": asin,
+                "Title": title,
+                "ImageURLs": img_urls
+            })
+
+    return pd.DataFrame(rows)
+
 def main():
     password_gate()
 
@@ -341,6 +372,30 @@ def main():
         "Choose input mode",
         ["Upload CLR", "Paste ASINs + Upload CLR (analyze only those ASINs)"],
         horizontal=False
+    )
+flat_text = ""
+if mode == "Paste Flat File Rows (TSV)":
+    flat_text = st.text_area(
+        "Paste flat-file rows here (tab-delimited). One product per line.",
+        height=240
+    )
+
+    if not flat_text.strip():
+        st.info("Paste your rows above to begin.")
+        return
+
+    df_flat = parse_flat_file_rows(flat_text)
+    if df_flat.empty:
+        st.error("No ASINs found. Make sure each row contains the word ASIN followed by the ASIN.")
+        return
+
+    st.caption(f"Parsed products: {len(df_flat):,}")
+
+flat_text = ""
+if mode == "Paste Flat File Rows (TSV)":
+    flat_text = st.text_area(
+        "Paste flat-file rows here (tab-delimited). One product per line.",
+        height=240
     )
 
     uploaded = st.file_uploader("Upload Category Listing Report (XLSX or CSV)", type=["xlsx", "csv"])
