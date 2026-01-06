@@ -363,43 +363,155 @@ def parse_flat_file_rows(tsv_text: str) -> pd.DataFrame:
             })
 
     return pd.DataFrame(rows)
-
 def main():
     password_gate()
 
     st.subheader("Input Mode")
-mode = st.radio(
-    "Choose input mode",
-    ["Upload CLR", "Paste ASINs + Upload CLR (analyze only those ASINs)", "Paste Flat File Rows (TSV)"],
-    horizontal=False
-)
-
-flat_text = ""
-if mode == "Paste Flat File Rows (TSV)":
-    flat_text = st.text_area(
-        "Paste flat-file rows here (tab-delimited). One product per line.",
-        height=240
+    mode = st.radio(
+        "Choose input mode",
+        ["Upload CLR", "Paste ASINs + Upload CLR (analyze only those ASINs)", "Paste Flat File Rows (TSV)"],
+        horizontal=False
     )
 
-    if not flat_text.strip():
-        st.info("Paste your rows above to begin.")
+    # -----------------------------
+    # Mode 3: Paste Flat File Rows
+    # -----------------------------
+    if mode == "Paste Flat File Rows (TSV)":
+        flat_text = st.text_area(
+            "Paste flat-file rows here (tab-delimited). One product per line.",
+            height=240
+        )
+
+        st.subheader("Analysis Settings")
+        eval_images = st.checkbox("Evaluate images individually", value=True)
+        max_images_per_asin = st.slider("Max images per ASIN", 1, 12, 8)
+        throttle = st.slider("Throttle between image downloads (seconds)", 0.0, 1.5, 0.2, 0.1)
+
+        if not flat_text.strip():
+            st.info("Paste your rows above to begin.")
+            return
+
+        df_flat = parse_flat_file_rows(flat_text)
+        if df_flat.empty:
+            st.error("No ASINs found. Make sure each row contains the word ASIN followed by the ASIN.")
+            return
+
+        st.caption(f"Parsed products: {len(df_flat):,}")
+
+        if st.button("Analyze & Generate Excel"):
+            summary_rows, content_rows, image_rows, action_rows = [], [], [], []
+            prog = st.progress(0)
+            total = len(df_flat)
+
+            for i, (_, row) in enumerate(df_flat.iterrows(), start=1):
+                asin = safe_str(row.get("ASIN", "")).upper().strip()
+                title = safe_str(row.get("Title", ""))
+                desc = ""  # not present in flat rows
+                bullets = []  # not present in flat rows
+                urls = list(row.get("ImageURLs", []))[:max_images_per_asin]
+
+                audits: List[ImageAudit] = []
+                if eval_images and urls:
+                    for idx, url in enumerate(urls, start=1):
+                        slot = "Main" if idx == 1 else f"Image{idx}"
+                        img = download_image(url)
+                        if img is None:
+                            audits.append(ImageAudit(
+                                asin=asin, slot=slot, url=url, role="Unknown",
+                                score=0, width=0, height=0,
+                                blur_flag="?", low_res_flag="?", background_flag="?",
+                                notes="Could not download image (blocked/expired).",
+                                fix="Verify URL or replace with accessible image link."
+                            ))
+                            continue
+
+                        score, flags, notes, fix = score_image(img, slot)
+                        role = role_suggestion(slot, float(flags["white_ratio"]))
+                        audits.append(ImageAudit(
+                            asin=asin, slot=slot, url=url, role=role,
+                            score=score, width=img.size[0], height=img.size[1],
+                            blur_flag=flags["blur_flag"],
+                            low_res_flag=flags["low_res_flag"],
+                            background_flag=flags["background_flag"],
+                            notes=notes + f" (white_ratio={flags['white_ratio']}, blur_metric={flags['blur_metric']})",
+                            fix=fix
+                        ))
+                        if throttle > 0:
+                            time.sleep(throttle)
+
+                overall, content_score, image_score, issues, actions = score_listing(title, bullets, desc, audits)
+
+                summary_rows.append({
+                    "ASIN": asin,
+                    "Overall Score (0-100)": overall,
+                    "Content Score (0-50)": content_score,
+                    "Image Score (0-25)": image_score,
+                    "Compliance Risk": "High" if overall < 70 else ("Med" if overall < 85 else "Low"),
+                    "Biggest Issues": " | ".join(issues),
+                    "Priority Actions": " | ".join(actions),
+                })
+
+                content_rows.append({
+                    "ASIN": asin,
+                    "Current Title": title,
+                    "Detected Bullets (1-5)": "",
+                    "Description": "",
+                    "Recommendations (rules-based)": " | ".join(actions),
+                    "Proposed Title (optional)": "",
+                    "Proposed Bullet 1 (optional)": "",
+                    "Proposed Bullet 2 (optional)": "",
+                    "Proposed Bullet 3 (optional)": "",
+                    "Proposed Bullet 4 (optional)": "",
+                    "Proposed Bullet 5 (optional)": "",
+                })
+
+                for a in audits:
+                    image_rows.append({
+                        "ASIN": a.asin,
+                        "Image Slot": a.slot,
+                        "Image URL": a.url,
+                        "Suggested Role": a.role,
+                        "Score (0-100)": a.score,
+                        "Width": a.width,
+                        "Height": a.height,
+                        "Blur Flag": a.blur_flag,
+                        "Low Res Flag": a.low_res_flag,
+                        "Background Flag": a.background_flag,
+                        "Notes": a.notes,
+                        "Recommended Fix": a.fix,
+                    })
+
+                for act in actions:
+                    action_rows.append({
+                        "ASIN": asin,
+                        "Area": "Images" if "image" in act.lower() else "Content",
+                        "Priority": "High" if overall < 70 else ("Med" if overall < 85 else "Low"),
+                        "Estimated Impact": "High" if ("replace" in act.lower() or "main image" in act.lower()) else "Med",
+                        "Action": act
+                    })
+
+                prog.progress(min(1.0, i / total))
+
+            summary_df = pd.DataFrame(summary_rows).sort_values(by="Overall Score (0-100)")
+            content_df = pd.DataFrame(content_rows)
+            image_df = pd.DataFrame(image_rows) if image_rows else pd.DataFrame([{"Notes": "No images evaluated."}])
+            action_df = pd.DataFrame(action_rows) if action_rows else pd.DataFrame([{"Action": "No actions generated."}])
+
+            xlsx = build_excel(summary_df, content_df, image_df, action_df)
+
+            st.success("Done. Download your Excel below.")
+            st.download_button(
+                "Download Excel (.xlsx)",
+                data=xlsx,
+                file_name="asin_listing_quality_export.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
         return
 
-    df_flat = parse_flat_file_rows(flat_text)
-    if df_flat.empty:
-        st.error("No ASINs found. Make sure each row contains the word ASIN followed by the ASIN.")
-        return
-
-    st.caption(f"Parsed products: {len(df_flat):,}")
-
-flat_text = ""
-if mode == "Paste Flat File Rows (TSV)":
-    flat_text = st.text_area(
-        "Paste flat-file rows here (tab-delimited). One product per line.",
-        height=240
-    )
-
-    uploaded = st.file_uploader("Upload Category Listing Report (XLSX or CSV)", type=["xlsx", "csv"])
+    # -----------------------------
+    # Mode 1/2: CLR Upload
+    # -----------------------------
+    uploaded = st.file_uploader("Upload Category Listing Report (XLSX/XLSM or CSV)", type=["xlsx", "xlsm", "csv"])
 
     asins = []
     if mode.startswith("Paste ASINs"):
@@ -412,39 +524,33 @@ if mode == "Paste Flat File Rows (TSV)":
 
     import openpyxl
 
-try:
-    if uploaded.name.lower().endswith((".xlsx", ".xlsm")):
-        wb = openpyxl.load_workbook(uploaded, read_only=True, keep_vba=True)
+    try:
+        if uploaded.name.lower().endswith((".xlsx", ".xlsm")):
+            wb = openpyxl.load_workbook(uploaded, read_only=True, keep_vba=True)
 
-        sheet_name = st.selectbox(
-            "Select sheet to analyze",
-            wb.sheetnames,
-            index=wb.sheetnames.index("Template") if "Template" in wb.sheetnames else 0
-        )
+            sheet_name = st.selectbox(
+                "Select sheet to analyze",
+                wb.sheetnames,
+                index=wb.sheetnames.index("Template") if "Template" in wb.sheetnames else 0
+            )
 
-        header_row = st.number_input(
-            "Row number where column names start",
-            min_value=1,
-            max_value=50,
-            value=4,
-            step=1
-        )
+            header_row = st.number_input(
+                "Row number where column names start",
+                min_value=1,
+                max_value=50,
+                value=4,
+                step=1
+            )
 
-        df = pd.read_excel(
-            uploaded,
-            sheet_name=sheet_name,
-            header=header_row - 1
-        )
-    else:
-        df = pd.read_csv(uploaded)
+            df = pd.read_excel(uploaded, sheet_name=sheet_name, header=header_row - 1)
+        else:
+            df = pd.read_csv(uploaded)
 
-except Exception as e:
-    st.error(f"Could not read file: {e}")
-    return
-
+    except Exception as e:
+        st.error(f"Could not read file: {e}")
+        return
 
     st.caption(f"Loaded rows: {len(df):,} | columns: {len(df.columns):,}")
-
     cols = list(df.columns)
 
     asin_guess = best_match_column(cols, ["asin", "product id", "product_id", "item id", "item_id"])
@@ -472,8 +578,16 @@ except Exception as e:
     left, right = st.columns(2)
     with left:
         asin_col = st.selectbox("ASIN column", cols, index=cols.index(asin_guess))
-        title_col = st.selectbox("Title column", ["(none)"] + cols, index=(["(none)"] + cols).index(title_guess) if title_guess in cols else 0)
-        desc_col = st.selectbox("Description column", ["(none)"] + cols, index=(["(none)"] + cols).index(desc_guess) if desc_guess in cols else 0)
+        title_col = st.selectbox(
+            "Title column",
+            ["(none)"] + cols,
+            index=(["(none)"] + cols).index(title_guess) if title_guess in cols else 0
+        )
+        desc_col = st.selectbox(
+            "Description column",
+            ["(none)"] + cols,
+            index=(["(none)"] + cols).index(desc_guess) if desc_guess in cols else 0
+        )
     with right:
         bullet_cols = st.multiselect("Bullet columns (up to 5)", cols, default=bullet_guess)
         image_cols = st.multiselect("Image URL columns (main + additional)", cols, default=image_guess)
@@ -494,7 +608,6 @@ except Exception as e:
             desc = safe_str(row.get(desc_col, "")) if desc_col != "(none)" else ""
             bullets = extract_bullets(row, bullet_cols)
 
-            # collect image urls
             urls = []
             for c in image_cols:
                 u = safe_str(row.get(c, ""))
@@ -586,18 +699,8 @@ except Exception as e:
 
         summary_df = pd.DataFrame(summary_rows).sort_values(by="Overall Score (0-100)")
         content_df = pd.DataFrame(content_rows)
-        image_df = pd.DataFrame(image_rows) if image_rows else pd.DataFrame([{"Notes": "No images evaluated."}])
-        action_df = pd.DataFrame(action_rows) if action_rows else pd.DataFrame([{"Action": "No actions generated."}])
+        image_df = pd.DataFrame(image_
 
-        xlsx = build_excel(summary_df, content_df, image_df, action_df)
-
-        st.success("Done. Download your Excel below.")
-        st.download_button(
-            "Download Excel (.xlsx)",
-            data=xlsx,
-            file_name="asin_listing_quality_export.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
 
 if __name__ == "__main__":
     main()
