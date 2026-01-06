@@ -1,3 +1,16 @@
+# app.py — Clean, stable Streamlit app (bulk CLR + pasted ASINs + pasted flat-file rows)
+# Shared-password access (no accounts / no emails)
+#
+# Key fixes vs your current version:
+# - No broken indentation
+# - No “return” paths that kill the download output after you click Analyze
+# - Bulk mode supports XLSX/XLSM/CSV and Amazon templates with header-row selector
+# - Optional ASIN filtering when file has Product Id Type + Product Id (ASIN vs UPC)
+# - “Paste Flat File Rows” mode dedupes by ASIN and keeps the row with most image URLs
+#
+# Put APP_PASSWORD in Streamlit Secrets:
+# APP_PASSWORD = "yourpassword"
+
 import io
 import re
 import time
@@ -10,6 +23,7 @@ import requests
 import streamlit as st
 from PIL import Image
 
+import openpyxl
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
 from openpyxl.utils.dataframe import dataframe_to_rows
@@ -45,12 +59,15 @@ def password_gate():
 def norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(s).strip().lower()).strip()
 
+
 def safe_str(x) -> str:
-    return "" if pd.isna(x) else str(x)
+    return "" if (x is None or (isinstance(x, float) and pd.isna(x)) or pd.isna(x)) else str(x)
+
 
 def looks_like_url(x: str) -> bool:
-    x = str(x)
+    x = str(x).strip()
     return x.startswith("http://") or x.startswith("https://")
+
 
 def best_match_column(cols: List[str], candidates: List[str]) -> Optional[str]:
     cols_norm = {c: norm(c) for c in cols}
@@ -68,7 +85,9 @@ def best_match_column(cols: List[str], candidates: List[str]) -> Optional[str]:
             best = c
     return best if best_score > 0 else None
 
+
 def pick_bullet_columns(cols: List[str]) -> List[str]:
+    # Tries to grab 1–5 bullet columns from various Amazon report variants
     cols_norm = [(c, norm(c)) for c in cols]
     candidates = []
     for c, cn in cols_norm:
@@ -80,38 +99,45 @@ def pick_bullet_columns(cols: List[str]) -> List[str]:
         return int(m.group(1)) if m else 99
 
     candidates.sort(key=sort_key)
-    return candidates
+    # Dedup while preserving order
+    seen, out = set(), []
+    for c in candidates:
+        if c not in seen:
+            out.append(c)
+            seen.add(c)
+    return out
+
 
 def extract_bullets(row: pd.Series, bullet_cols: List[str]) -> List[str]:
     bullets = []
     for c in bullet_cols:
-        v = safe_str(row.get(c, ""))
-        if v.strip():
-            bullets.append(v.strip())
+        v = safe_str(row.get(c, "")).strip()
+        if v:
+            bullets.append(v)
 
     if not bullets:
+        # Sometimes bullets are a single multi-line cell
         for c in row.index:
             cn = norm(c)
             if cn in ("bullet points", "bullets", "key product features", "key features"):
-                v = safe_str(row.get(c, ""))
-                if v.strip():
+                v = safe_str(row.get(c, "")).strip()
+                if v:
                     parts = [p.strip("• \t-") for p in re.split(r"[\r\n]+", v) if p.strip()]
                     bullets.extend([p for p in parts if p])
 
     return bullets[:5]
 
+
 def find_image_url_columns(cols: List[str]) -> List[str]:
-    # CLR variants differ; we’ll collect anything that looks like image url/link fields
     out = []
     for c in cols:
         cn = norm(c)
-        if "image" in cn and ("url" in cn or "link" in cn):
-            out.append(c)
-        if cn in ("main image url", "mainimageurl", "main_image_url"):
+        # "Main Image URL", "Other Image URL", "Image URL 1" etc.
+        if "image" in cn and ("url" in cn or "link" in cn or "location" in cn):
             out.append(c)
 
-    seen = set()
-    dedup = []
+    # Dedup
+    seen, dedup = set(), []
     for c in out:
         if c not in seen:
             dedup.append(c)
@@ -137,6 +163,7 @@ class ImageAudit:
     notes: str
     fix: str
 
+
 def download_image(url: str, timeout=15) -> Optional[Image.Image]:
     try:
         r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
@@ -145,22 +172,31 @@ def download_image(url: str, timeout=15) -> Optional[Image.Image]:
     except Exception:
         return None
 
+
 def laplacian_variance(gray: np.ndarray) -> float:
+    # Lightweight blur heuristic
     gy = np.abs(np.diff(gray.astype(np.float32), axis=0)).mean()
     gx = np.abs(np.diff(gray.astype(np.float32), axis=1)).mean()
     return float(gx + gy)
+
 
 def estimate_border_white_ratio(img: Image.Image) -> float:
     arr = np.asarray(img).astype(np.float32)
     h, w, _ = arr.shape
     b = 10
-    border = np.concatenate([
-        arr[0:b, :, :].reshape(-1, 3),
-        arr[h-b:h, :, :].reshape(-1, 3),
-        arr[:, 0:b, :].reshape(-1, 3),
-        arr[:, w-b:w, :].reshape(-1, 3),
-    ], axis=0)
+    if h < 20 or w < 20:
+        return 0.0
+    border = np.concatenate(
+        [
+            arr[0:b, :, :].reshape(-1, 3),
+            arr[h - b : h, :, :].reshape(-1, 3),
+            arr[:, 0:b, :].reshape(-1, 3),
+            arr[:, w - b : w, :].reshape(-1, 3),
+        ],
+        axis=0,
+    )
     return float(np.mean((border[:, 0] > 240) & (border[:, 1] > 240) & (border[:, 2] > 240)))
+
 
 def role_suggestion(slot: str, white_ratio: float) -> str:
     if slot == "Main" and white_ratio > 0.75:
@@ -169,23 +205,28 @@ def role_suggestion(slot: str, white_ratio: float) -> str:
         return "Secondary (white background)"
     return "Lifestyle / Infographic"
 
+
 def score_image(img: Image.Image, slot: str) -> Tuple[int, Dict[str, str], str, str]:
     arr = np.asarray(img)
     h, w = arr.shape[:2]
     longest = max(w, h)
 
-    # Flags
     low_res = longest < 1000
+
     gray = np.dot(arr[..., :3], [0.299, 0.587, 0.114]).astype(np.uint8)
     blur_metric = laplacian_variance(gray)
-    blur = blur_metric < 6.0  # heuristic
+    blur = blur_metric < 6.0
+
     white_ratio = estimate_border_white_ratio(img)
     bg_issue = (slot == "Main" and white_ratio < 0.55)
 
     score = 100
-    if low_res: score -= 25
-    if blur: score -= 25
-    if bg_issue: score -= 20
+    if low_res:
+        score -= 25
+    if blur:
+        score -= 25
+    if bg_issue:
+        score -= 20
     score = int(max(0, min(100, score)))
 
     notes = []
@@ -214,7 +255,7 @@ def score_image(img: Image.Image, slot: str) -> Tuple[int, Dict[str, str], str, 
 
 
 # -----------------------------
-# Listing scoring (basic, stable rules)
+# Listing scoring (stable rules)
 # -----------------------------
 def score_listing(title: str, bullets: List[str], desc: str, images: List[ImageAudit]) -> Tuple[int, int, int, List[str], List[str]]:
     issues, actions = [], []
@@ -275,9 +316,8 @@ def score_listing(title: str, bullets: List[str], desc: str, images: List[ImageA
 
     img_score = max(0, min(25, img_score))
 
-    # Signals (0–25) – CLR usually doesn’t contain reviews, keep neutral for now
+    # Signals (0–25) – neutral (no review/pdp data in CLR)
     signals = 25
-
     overall = content + img_score + signals
     return overall, content, img_score, issues[:6], actions[:6]
 
@@ -296,8 +336,16 @@ def add_df_table(ws, df: pd.DataFrame, table_name: str):
 
     end_row = ws.max_row
     end_col = ws.max_column
-    # simple A1 range; safe for <= 26 cols (fine for our output)
-    ref = f"A1:{chr(64 + min(end_col, 26))}{end_row}"
+
+    # Build A1 range (handles >26 cols safely)
+    def col_letter(n: int) -> str:
+        s = ""
+        while n > 0:
+            n, r = divmod(n - 1, 26)
+            s = chr(65 + r) + s
+        return s
+
+    ref = f"A1:{col_letter(end_col)}{end_row}"
     tab = Table(displayName=table_name, ref=ref)
     tab.tableStyleInfo = TableStyleInfo(
         name="TableStyleMedium9",
@@ -308,6 +356,7 @@ def add_df_table(ws, df: pd.DataFrame, table_name: str):
     )
     ws.add_table(tab)
     ws.freeze_panes = "A2"
+
 
 def build_excel(summary_df, content_df, image_df, action_df) -> bytes:
     wb = Workbook()
@@ -331,7 +380,7 @@ def build_excel(summary_df, content_df, image_df, action_df) -> bytes:
 
 
 # -----------------------------
-# Streamlit App
+# Paste Flat-File Rows (TSV) parser
 # -----------------------------
 def parse_flat_file_rows(tsv_text: str) -> pd.DataFrame:
     rows = []
@@ -339,30 +388,49 @@ def parse_flat_file_rows(tsv_text: str) -> pd.DataFrame:
         if not line.strip():
             continue
 
-        parts = line.split("\t")
-        parts = [p.strip() for p in parts]
+        parts = [p.strip() for p in line.split("\t")]
 
-        # Find ASIN value by locating the literal "ASIN" token
         asin = ""
         for i, p in enumerate(parts):
             if p.upper() == "ASIN" and i + 1 < len(parts):
                 asin = parts[i + 1].strip().upper()
                 break
 
-        # Title is typically the 2nd column in your sample
         title = parts[1] if len(parts) > 1 else ""
-
-        # Grab image URLs anywhere in the row
         img_urls = [p for p in parts if p.startswith("http") and ".jpg" in p.lower()]
 
         if asin:
-            rows.append({
-                "ASIN": asin,
-                "Title": title,
-                "ImageURLs": img_urls
-            })
+            rows.append({"ASIN": asin, "Title": title, "ImageURLs": img_urls, "ImageCount": len(img_urls)})
 
-    return pd.DataFrame(rows)
+    if not rows:
+        return pd.DataFrame(columns=["ASIN", "Title", "ImageURLs", "ImageCount"])
+
+    df = pd.DataFrame(rows)
+
+    # Deduplicate ASINs: keep the row with most image URLs
+    df = df.sort_values(["ASIN", "ImageCount"], ascending=[True, False])
+    df = df.drop_duplicates(subset=["ASIN"], keep="first").reset_index(drop=True)
+    return df
+
+
+# -----------------------------
+# File loader (XLSX/XLSM/CSV)
+# -----------------------------
+def load_uploaded_file(uploaded) -> pd.DataFrame:
+    name = uploaded.name.lower()
+
+    if name.endswith((".xlsx", ".xlsm")):
+        # Peek sheet names for a selector in the UI (handled in main)
+        # We will read with pandas using provided sheet/header.
+        raise RuntimeError("XLSX/XLSM requires sheet/header selection (handled in main).")
+
+    # CSV
+    return pd.read_csv(uploaded)
+
+
+# -----------------------------
+# Streamlit App
+# -----------------------------
 def main():
     password_gate()
 
@@ -370,139 +438,41 @@ def main():
     mode = st.radio(
         "Choose input mode",
         ["Upload CLR", "Paste ASINs + Upload CLR (analyze only those ASINs)", "Paste Flat File Rows (TSV)"],
-        horizontal=False
+        horizontal=False,
     )
+
+    # Global analysis settings (shown for all modes)
+    st.subheader("Analysis Settings")
+    eval_images = st.checkbox("Evaluate images individually", value=True)
+    max_images_per_asin = st.slider("Max images per ASIN", 1, 12, 8)
+    throttle = st.slider("Throttle between image downloads (seconds)", 0.0, 1.5, 0.2, 0.1)
+
+    # Output holder in session_state (prevents “lost” download button on rerun)
+    if "last_xlsx" not in st.session_state:
+        st.session_state.last_xlsx = None
 
     # -----------------------------
     # Mode 3: Paste Flat File Rows
     # -----------------------------
     if mode == "Paste Flat File Rows (TSV)":
-        flat_text = st.text_area(
-            "Paste flat-file rows here (tab-delimited). One product per line.",
-            height=240
-        )
+        st.info("This mode is best for IMAGE AUDITS at scale. It extracts ASIN + Title + Image URLs from pasted rows.")
+        flat_text = st.text_area("Paste flat-file rows here (tab-delimited). One product per line.", height=240)
 
-        st.subheader("Analysis Settings")
-        eval_images = st.checkbox("Evaluate images individually", value=True)
-        max_images_per_asin = st.slider("Max images per ASIN", 1, 12, 8)
-        throttle = st.slider("Throttle between image downloads (seconds)", 0.0, 1.5, 0.2, 0.1)
+        can_run = bool(flat_text.strip())
 
-        if not flat_text.strip():
-            st.info("Paste your rows above to begin.")
-            return
+        if st.button("Analyze & Generate Excel", disabled=not can_run):
+            df_flat = parse_flat_file_rows(flat_text)
+            if df_flat.empty:
+                st.error("No ASINs found. Make sure each row contains the word ASIN followed by the ASIN.")
+            else:
+                xlsx_bytes = run_analysis_from_flat(df_flat, eval_images, max_images_per_asin, throttle)
+                st.session_state.last_xlsx = xlsx_bytes
+                st.success("Done. Download your Excel below.")
 
-        df_flat = parse_flat_file_rows(flat_text)
-        if df_flat.empty:
-            st.error("No ASINs found. Make sure each row contains the word ASIN followed by the ASIN.")
-            return
-
-        st.caption(f"Parsed products: {len(df_flat):,}")
-
-        if st.button("Analyze & Generate Excel"):
-            summary_rows, content_rows, image_rows, action_rows = [], [], [], []
-            prog = st.progress(0)
-            total = len(df_flat)
-
-            for i, (_, row) in enumerate(df_flat.iterrows(), start=1):
-                asin = safe_str(row.get("ASIN", "")).upper().strip()
-                title = safe_str(row.get("Title", ""))
-                desc = ""  # not present in flat rows
-                bullets = []  # not present in flat rows
-                urls = list(row.get("ImageURLs", []))[:max_images_per_asin]
-
-                audits: List[ImageAudit] = []
-                if eval_images and urls:
-                    for idx, url in enumerate(urls, start=1):
-                        slot = "Main" if idx == 1 else f"Image{idx}"
-                        img = download_image(url)
-                        if img is None:
-                            audits.append(ImageAudit(
-                                asin=asin, slot=slot, url=url, role="Unknown",
-                                score=0, width=0, height=0,
-                                blur_flag="?", low_res_flag="?", background_flag="?",
-                                notes="Could not download image (blocked/expired).",
-                                fix="Verify URL or replace with accessible image link."
-                            ))
-                            continue
-
-                        score, flags, notes, fix = score_image(img, slot)
-                        role = role_suggestion(slot, float(flags["white_ratio"]))
-                        audits.append(ImageAudit(
-                            asin=asin, slot=slot, url=url, role=role,
-                            score=score, width=img.size[0], height=img.size[1],
-                            blur_flag=flags["blur_flag"],
-                            low_res_flag=flags["low_res_flag"],
-                            background_flag=flags["background_flag"],
-                            notes=notes + f" (white_ratio={flags['white_ratio']}, blur_metric={flags['blur_metric']})",
-                            fix=fix
-                        ))
-                        if throttle > 0:
-                            time.sleep(throttle)
-
-                overall, content_score, image_score, issues, actions = score_listing(title, bullets, desc, audits)
-
-                summary_rows.append({
-                    "ASIN": asin,
-                    "Overall Score (0-100)": overall,
-                    "Content Score (0-50)": content_score,
-                    "Image Score (0-25)": image_score,
-                    "Compliance Risk": "High" if overall < 70 else ("Med" if overall < 85 else "Low"),
-                    "Biggest Issues": " | ".join(issues),
-                    "Priority Actions": " | ".join(actions),
-                })
-
-                content_rows.append({
-                    "ASIN": asin,
-                    "Current Title": title,
-                    "Detected Bullets (1-5)": "",
-                    "Description": "",
-                    "Recommendations (rules-based)": " | ".join(actions),
-                    "Proposed Title (optional)": "",
-                    "Proposed Bullet 1 (optional)": "",
-                    "Proposed Bullet 2 (optional)": "",
-                    "Proposed Bullet 3 (optional)": "",
-                    "Proposed Bullet 4 (optional)": "",
-                    "Proposed Bullet 5 (optional)": "",
-                })
-
-                for a in audits:
-                    image_rows.append({
-                        "ASIN": a.asin,
-                        "Image Slot": a.slot,
-                        "Image URL": a.url,
-                        "Suggested Role": a.role,
-                        "Score (0-100)": a.score,
-                        "Width": a.width,
-                        "Height": a.height,
-                        "Blur Flag": a.blur_flag,
-                        "Low Res Flag": a.low_res_flag,
-                        "Background Flag": a.background_flag,
-                        "Notes": a.notes,
-                        "Recommended Fix": a.fix,
-                    })
-
-                for act in actions:
-                    action_rows.append({
-                        "ASIN": asin,
-                        "Area": "Images" if "image" in act.lower() else "Content",
-                        "Priority": "High" if overall < 70 else ("Med" if overall < 85 else "Low"),
-                        "Estimated Impact": "High" if ("replace" in act.lower() or "main image" in act.lower()) else "Med",
-                        "Action": act
-                    })
-
-                prog.progress(min(1.0, i / total))
-
-            summary_df = pd.DataFrame(summary_rows).sort_values(by="Overall Score (0-100)")
-            content_df = pd.DataFrame(content_rows)
-            image_df = pd.DataFrame(image_rows) if image_rows else pd.DataFrame([{"Notes": "No images evaluated."}])
-            action_df = pd.DataFrame(action_rows) if action_rows else pd.DataFrame([{"Action": "No actions generated."}])
-
-            xlsx = build_excel(summary_df, content_df, image_df, action_df)
-
-            st.success("Done. Download your Excel below.")
+        if st.session_state.last_xlsx:
             st.download_button(
                 "Download Excel (.xlsx)",
-                data=xlsx,
+                data=st.session_state.last_xlsx,
                 file_name="asin_listing_quality_export.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
@@ -511,64 +481,93 @@ def main():
     # -----------------------------
     # Mode 1/2: CLR Upload
     # -----------------------------
-    uploaded = st.file_uploader("Upload Category Listing Report (XLSX/XLSM or CSV)", type=["xlsx", "xlsm", "csv"])
+    uploaded = st.file_uploader(
+        "Upload Category Listing Report (XLSX/XLSM or CSV)",
+        type=["xlsx", "xlsm", "csv"],
+    )
 
-    asins = []
+    pasted_asins: List[str] = []
     if mode.startswith("Paste ASINs"):
         raw = st.text_area("Paste ASINs (one per line)", height=140)
-        asins = [a.strip().upper() for a in raw.splitlines() if a.strip()]
+        pasted_asins = [a.strip().upper() for a in raw.splitlines() if a.strip()]
 
     if not uploaded:
-        st.info("Upload a CLR to begin.")
+        st.info("Upload a file to begin.")
+        # Still show last download if exists
+        if st.session_state.last_xlsx:
+            st.download_button(
+                "Download Excel (.xlsx)",
+                data=st.session_state.last_xlsx,
+                file_name="asin_listing_quality_export.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
         return
 
-    import openpyxl
+    # Load data
+    df = None
+    if uploaded.name.lower().endswith((".xlsx", ".xlsm")):
+        wb = openpyxl.load_workbook(uploaded, read_only=True, keep_vba=True)
+        sheet_name = st.selectbox(
+            "Select sheet to analyze",
+            wb.sheetnames,
+            index=wb.sheetnames.index("Template") if "Template" in wb.sheetnames else 0,
+        )
+        header_row = st.number_input("Row number where column names start", min_value=1, max_value=50, value=4, step=1)
 
-    try:
-        if uploaded.name.lower().endswith((".xlsx", ".xlsm")):
-            wb = openpyxl.load_workbook(uploaded, read_only=True, keep_vba=True)
-
-            sheet_name = st.selectbox(
-                "Select sheet to analyze",
-                wb.sheetnames,
-                index=wb.sheetnames.index("Template") if "Template" in wb.sheetnames else 0
-            )
-
-            header_row = st.number_input(
-                "Row number where column names start",
-                min_value=1,
-                max_value=50,
-                value=4,
-                step=1
-            )
-
+        try:
             df = pd.read_excel(uploaded, sheet_name=sheet_name, header=header_row - 1)
-        else:
+        except Exception as e:
+            st.error(f"Could not read Excel: {e}")
+            df = None
+    else:
+        try:
             df = pd.read_csv(uploaded)
+        except Exception as e:
+            st.error(f"Could not read CSV: {e}")
+            df = None
 
-    except Exception as e:
-        st.error(f"Could not read file: {e}")
+    if df is None or df.empty:
+        st.error("No rows loaded. Check the sheet/header row settings.")
         return
 
     st.caption(f"Loaded rows: {len(df):,} | columns: {len(df.columns):,}")
     cols = list(df.columns)
 
+    # If this is a flat-file style sheet, filter to Product Id Type = ASIN when available
+    pid_type_col = best_match_column(cols, ["product id type", "product-id type", "product_id_type"])
+    pid_col = best_match_column(cols, ["product id", "product-id", "product_id"])
+
+    # Default ASIN guess
     asin_guess = best_match_column(cols, ["asin", "product id", "product_id", "item id", "item_id"])
+
+    # If Product Id Type exists, we strongly recommend using Product Id + filter
+    auto_filter_asin_only = False
+    if pid_type_col and pid_col:
+        auto_filter_asin_only = st.checkbox("Auto-filter to ASIN rows only (recommended)", value=True)
+        if auto_filter_asin_only:
+            df[pid_type_col] = df[pid_type_col].astype(str).str.upper().str.strip()
+            df[pid_col] = df[pid_col].astype(str).str.upper().str.strip()
+            df = df[df[pid_type_col] == "ASIN"].copy()
+            st.caption(f"After ASIN-only filter: {len(df):,} rows")
+
+            # In this case, ASIN column should be Product Id
+            asin_guess = pid_col
+
     if not asin_guess:
-        st.error("Could not detect an ASIN column. Your CLR must include ASIN.")
+        st.error("Could not detect an ASIN column. Your file must include ASINs.")
         return
 
     df[asin_guess] = df[asin_guess].astype(str).str.upper().str.strip()
 
-    if asins:
-        df = df[df[asin_guess].isin(asins)].copy()
+    if pasted_asins:
+        df = df[df[asin_guess].isin(pasted_asins)].copy()
         st.caption(f"Filtered to pasted ASINs: {len(df):,}")
         if df.empty:
-            st.warning("No matching ASINs found in the CLR.")
+            st.warning("No matching ASINs found in the uploaded file.")
             return
 
+    # Column mapping UI
     st.subheader("Column Mapping (auto-detected, adjust if needed)")
-
     title_guess = best_match_column(cols, ["item name", "title", "product name", "item_name"])
     desc_guess = best_match_column(cols, ["product description", "description", "product_description"])
 
@@ -578,75 +577,90 @@ def main():
     left, right = st.columns(2)
     with left:
         asin_col = st.selectbox("ASIN column", cols, index=cols.index(asin_guess))
-        title_col = st.selectbox(
-            "Title column",
-            ["(none)"] + cols,
-            index=(["(none)"] + cols).index(title_guess) if title_guess in cols else 0
-        )
-        desc_col = st.selectbox(
-            "Description column",
-            ["(none)"] + cols,
-            index=(["(none)"] + cols).index(desc_guess) if desc_guess in cols else 0
-        )
+        title_col = st.selectbox("Title column", ["(none)"] + cols, index=(["(none)"] + cols).index(title_guess) if title_guess in cols else 0)
+        desc_col = st.selectbox("Description column", ["(none)"] + cols, index=(["(none)"] + cols).index(desc_guess) if desc_guess in cols else 0)
     with right:
         bullet_cols = st.multiselect("Bullet columns (up to 5)", cols, default=bullet_guess)
         image_cols = st.multiselect("Image URL columns (main + additional)", cols, default=image_guess)
 
-    st.subheader("Analysis Settings")
-    eval_images = st.checkbox("Evaluate images individually", value=True)
-    max_images_per_asin = st.slider("Max images per ASIN", 1, 12, 8)
-    throttle = st.slider("Throttle between image downloads (seconds)", 0.0, 1.5, 0.2, 0.1)
-
+    # Run button
     if st.button("Analyze & Generate Excel"):
-        summary_rows, content_rows, image_rows, action_rows = [], [], [], []
-        prog = st.progress(0)
-        total = len(df)
+        xlsx_bytes = run_analysis_from_df(df, asin_col, title_col, desc_col, bullet_cols, image_cols, eval_images, max_images_per_asin, throttle)
+        st.session_state.last_xlsx = xlsx_bytes
+        st.success("Done. Download your Excel below.")
 
-        for i, (_, row) in enumerate(df.iterrows(), start=1):
-            asin = safe_str(row.get(asin_col, "")).upper().strip()
-            title = safe_str(row.get(title_col, "")) if title_col != "(none)" else ""
-            desc = safe_str(row.get(desc_col, "")) if desc_col != "(none)" else ""
-            bullets = extract_bullets(row, bullet_cols)
+    # Download button (always visible if we have output)
+    if st.session_state.last_xlsx:
+        st.download_button(
+            "Download Excel (.xlsx)",
+            data=st.session_state.last_xlsx,
+            file_name="asin_listing_quality_export.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
-            urls = []
-            for c in image_cols:
-                u = safe_str(row.get(c, ""))
-                if u and looks_like_url(u):
-                    urls.append(u)
-            urls = urls[:max_images_per_asin]
 
-            audits: List[ImageAudit] = []
-            if eval_images and urls:
-                for idx, url in enumerate(urls, start=1):
-                    slot = "Main" if idx == 1 else f"Image{idx}"
-                    img = download_image(url)
-                    if img is None:
-                        audits.append(ImageAudit(
-                            asin=asin, slot=slot, url=url, role="Unknown",
-                            score=0, width=0, height=0,
-                            blur_flag="?", low_res_flag="?", background_flag="?",
+def run_analysis_from_flat(df_flat: pd.DataFrame, eval_images: bool, max_images_per_asin: int, throttle: float) -> bytes:
+    summary_rows, content_rows, image_rows, action_rows = [], [], [], []
+    prog = st.progress(0)
+    total = len(df_flat)
+
+    for i, (_, row) in enumerate(df_flat.iterrows(), start=1):
+        asin = safe_str(row.get("ASIN", "")).upper().strip()
+        title = safe_str(row.get("Title", ""))
+        desc = ""
+        bullets: List[str] = []
+
+        urls = list(row.get("ImageURLs", []))[:max_images_per_asin]
+
+        audits: List[ImageAudit] = []
+        if eval_images and urls:
+            for idx, url in enumerate(urls, start=1):
+                slot = "Main" if idx == 1 else f"Image{idx}"
+                img = download_image(url)
+                if img is None:
+                    audits.append(
+                        ImageAudit(
+                            asin=asin,
+                            slot=slot,
+                            url=url,
+                            role="Unknown",
+                            score=0,
+                            width=0,
+                            height=0,
+                            blur_flag="?",
+                            low_res_flag="?",
+                            background_flag="?",
                             notes="Could not download image (blocked/expired).",
-                            fix="Verify URL or replace with accessible image link."
-                        ))
-                        continue
+                            fix="Verify URL or replace with accessible image link.",
+                        )
+                    )
+                    continue
 
-                    score, flags, notes, fix = score_image(img, slot)
-                    role = role_suggestion(slot, float(flags["white_ratio"]))
-                    audits.append(ImageAudit(
-                        asin=asin, slot=slot, url=url, role=role,
-                        score=score, width=img.size[0], height=img.size[1],
+                score, flags, notes, fix = score_image(img, slot)
+                role = role_suggestion(slot, float(flags["white_ratio"]))
+                audits.append(
+                    ImageAudit(
+                        asin=asin,
+                        slot=slot,
+                        url=url,
+                        role=role,
+                        score=score,
+                        width=img.size[0],
+                        height=img.size[1],
                         blur_flag=flags["blur_flag"],
                         low_res_flag=flags["low_res_flag"],
                         background_flag=flags["background_flag"],
                         notes=notes + f" (white_ratio={flags['white_ratio']}, blur_metric={flags['blur_metric']})",
-                        fix=fix
-                    ))
-                    if throttle > 0:
-                        time.sleep(throttle)
+                        fix=fix,
+                    )
+                )
+                if throttle > 0:
+                    time.sleep(throttle)
 
-            overall, content_score, image_score, issues, actions = score_listing(title, bullets, desc, audits)
+        overall, content_score, image_score, issues, actions = score_listing(title, bullets, desc, audits)
 
-            summary_rows.append({
+        summary_rows.append(
+            {
                 "ASIN": asin,
                 "Overall Score (0-100)": overall,
                 "Content Score (0-50)": content_score,
@@ -654,13 +668,15 @@ def main():
                 "Compliance Risk": "High" if overall < 70 else ("Med" if overall < 85 else "Low"),
                 "Biggest Issues": " | ".join(issues),
                 "Priority Actions": " | ".join(actions),
-            })
+            }
+        )
 
-            content_rows.append({
+        content_rows.append(
+            {
                 "ASIN": asin,
                 "Current Title": title,
-                "Detected Bullets (1-5)": "\n".join([f"{j+1}. {b}" for j, b in enumerate(bullets)]),
-                "Description": desc,
+                "Detected Bullets (1-5)": "",
+                "Description": "",
                 "Recommendations (rules-based)": " | ".join(actions),
                 "Proposed Title (optional)": "",
                 "Proposed Bullet 1 (optional)": "",
@@ -668,10 +684,12 @@ def main():
                 "Proposed Bullet 3 (optional)": "",
                 "Proposed Bullet 4 (optional)": "",
                 "Proposed Bullet 5 (optional)": "",
-            })
+            }
+        )
 
-            for a in audits:
-                image_rows.append({
+        for a in audits:
+            image_rows.append(
+                {
                     "ASIN": a.asin,
                     "Image Slot": a.slot,
                     "Image URL": a.url,
@@ -684,23 +702,170 @@ def main():
                     "Background Flag": a.background_flag,
                     "Notes": a.notes,
                     "Recommended Fix": a.fix,
-                })
+                }
+            )
 
-            for act in actions:
-                action_rows.append({
+        for act in actions:
+            action_rows.append(
+                {
                     "ASIN": asin,
                     "Area": "Images" if "image" in act.lower() else "Content",
                     "Priority": "High" if overall < 70 else ("Med" if overall < 85 else "Low"),
                     "Estimated Impact": "High" if ("replace" in act.lower() or "main image" in act.lower()) else "Med",
-                    "Action": act
-                })
+                    "Action": act,
+                }
+            )
 
-            prog.progress(min(1.0, i / total))
+        prog.progress(min(1.0, i / total))
 
-        summary_df = pd.DataFrame(summary_rows).sort_values(by="Overall Score (0-100)")
-        content_df = pd.DataFrame(content_rows)
-        image_df = pd.DataFrame(image_rows) if image_rows else pd.DataFrame([{"Notes": "No images evaluated."}])
+    summary_df = pd.DataFrame(summary_rows).sort_values(by="Overall Score (0-100)")
+    content_df = pd.DataFrame(content_rows)
+    image_df = pd.DataFrame(image_rows) if image_rows else pd.DataFrame([{"Notes": "No images evaluated."}])
+    action_df = pd.DataFrame(action_rows) if action_rows else pd.DataFrame([{"Action": "No actions generated."}])
 
+    return build_excel(summary_df, content_df, image_df, action_df)
+
+
+def run_analysis_from_df(
+    df: pd.DataFrame,
+    asin_col: str,
+    title_col: str,
+    desc_col: str,
+    bullet_cols: List[str],
+    image_cols: List[str],
+    eval_images: bool,
+    max_images_per_asin: int,
+    throttle: float,
+) -> bytes:
+    summary_rows, content_rows, image_rows, action_rows = [], [], [], []
+    prog = st.progress(0)
+    total = len(df)
+
+    for i, (_, row) in enumerate(df.iterrows(), start=1):
+        asin = safe_str(row.get(asin_col, "")).upper().strip()
+        title = safe_str(row.get(title_col, "")) if title_col != "(none)" else ""
+        desc = safe_str(row.get(desc_col, "")) if desc_col != "(none)" else ""
+        bullets = extract_bullets(row, bullet_cols)
+
+        urls = []
+        for c in image_cols:
+            u = safe_str(row.get(c, "")).strip()
+            if u and looks_like_url(u):
+                urls.append(u)
+        urls = urls[:max_images_per_asin]
+
+        audits: List[ImageAudit] = []
+        if eval_images and urls:
+            for idx, url in enumerate(urls, start=1):
+                slot = "Main" if idx == 1 else f"Image{idx}"
+                img = download_image(url)
+                if img is None:
+                    audits.append(
+                        ImageAudit(
+                            asin=asin,
+                            slot=slot,
+                            url=url,
+                            role="Unknown",
+                            score=0,
+                            width=0,
+                            height=0,
+                            blur_flag="?",
+                            low_res_flag="?",
+                            background_flag="?",
+                            notes="Could not download image (blocked/expired).",
+                            fix="Verify URL or replace with accessible image link.",
+                        )
+                    )
+                    continue
+
+                score, flags, notes, fix = score_image(img, slot)
+                role = role_suggestion(slot, float(flags["white_ratio"]))
+                audits.append(
+                    ImageAudit(
+                        asin=asin,
+                        slot=slot,
+                        url=url,
+                        role=role,
+                        score=score,
+                        width=img.size[0],
+                        height=img.size[1],
+                        blur_flag=flags["blur_flag"],
+                        low_res_flag=flags["low_res_flag"],
+                        background_flag=flags["background_flag"],
+                        notes=notes + f" (white_ratio={flags['white_ratio']}, blur_metric={flags['blur_metric']})",
+                        fix=fix,
+                    )
+                )
+                if throttle > 0:
+                    time.sleep(throttle)
+
+        overall, content_score, image_score, issues, actions = score_listing(title, bullets, desc, audits)
+
+        summary_rows.append(
+            {
+                "ASIN": asin,
+                "Overall Score (0-100)": overall,
+                "Content Score (0-50)": content_score,
+                "Image Score (0-25)": image_score,
+                "Compliance Risk": "High" if overall < 70 else ("Med" if overall < 85 else "Low"),
+                "Biggest Issues": " | ".join(issues),
+                "Priority Actions": " | ".join(actions),
+            }
+        )
+
+        content_rows.append(
+            {
+                "ASIN": asin,
+                "Current Title": title,
+                "Detected Bullets (1-5)": "\n".join([f"{j+1}. {b}" for j, b in enumerate(bullets)]),
+                "Description": desc,
+                "Recommendations (rules-based)": " | ".join(actions),
+                "Proposed Title (optional)": "",
+                "Proposed Bullet 1 (optional)": "",
+                "Proposed Bullet 2 (optional)": "",
+                "Proposed Bullet 3 (optional)": "",
+                "Proposed Bullet 4 (optional)": "",
+                "Proposed Bullet 5 (optional)": "",
+            }
+        )
+
+        for a in audits:
+            image_rows.append(
+                {
+                    "ASIN": a.asin,
+                    "Image Slot": a.slot,
+                    "Image URL": a.url,
+                    "Suggested Role": a.role,
+                    "Score (0-100)": a.score,
+                    "Width": a.width,
+                    "Height": a.height,
+                    "Blur Flag": a.blur_flag,
+                    "Low Res Flag": a.low_res_flag,
+                    "Background Flag": a.background_flag,
+                    "Notes": a.notes,
+                    "Recommended Fix": a.fix,
+                }
+            )
+
+        for act in actions:
+            action_rows.append(
+                {
+                    "ASIN": asin,
+                    "Area": "Images" if "image" in act.lower() else "Content",
+                    "Priority": "High" if overall < 70 else ("Med" if overall < 85 else "Low"),
+                    "Estimated Impact": "High" if ("replace" in act.lower() or "main image" in act.lower()) else "Med",
+                    "Action": act,
+                }
+            )
+
+        prog.progress(min(1.0, i / total))
+
+    summary_df = pd.DataFrame(summary_rows).sort_values(by="Overall Score (0-100)")
+    content_df = pd.DataFrame(content_rows)
+    image_df = pd.DataFrame(image_rows) if image_rows else pd.DataFrame([{"Notes": "No images evaluated."}])
+    action_df = pd.DataFrame(action_rows) if action_rows else pd.DataFrame([{"Action": "No actions generated."}])
+
+    return build_excel(summary_df, content_df, image_df, action_df)
 
 
 if __name__ == "__main__":
